@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Drive Diashow</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;1,300&family=DM+Mono:wght@300;400&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#0a0a0a; overflow:hidden; -webkit-tap-highlight-color:transparent; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+const SLIDE_DURATION   = 6000;
+const REFRESH_INTERVAL = 2 * 60 * 1000;
+const LS_KEY    = "ds_apikey";
+const LS_FOLDER = "ds_folder";
+const DB_NAME   = "diashow_cache";
+const DB_VER    = 1;
+const STORE     = "images";
+
+// ── IndexedDB helpers ────────────────────────────────────────────────────────
+function openDB() {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open(DB_NAME, DB_VER);
+    req.onupgradeneeded = e => e.target.result.createObjectStore(STORE, { keyPath: "id" });
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
+  });
+}
+async function dbGetAll() {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE, "readonly");
+    const req = tx.objectStore(STORE).getAll();
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
+  });
+}
+async function dbPut(record) {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).put(record);
+    tx.oncomplete = res;
+    tx.onerror    = e => rej(e.target.error);
+  });
+}
+async function dbClear() {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).clear();
+    tx.oncomplete = res;
+    tx.onerror    = e => rej(e.target.error);
+  });
+}
+
+// ── Drive API ────────────────────────────────────────────────────────────────
+function extractFolderId(input) {
+  const m = input.match(/folders\/([a-zA-Z0-9_-]+)/);
+  if (m) return m[1];
+  if (/^[a-zA-Z0-9_-]{20,}$/.test(input.trim())) return input.trim();
+  return null;
+}
+
+async function driveListImages(folderId, apiKey) {
+  const q  = encodeURIComponent(`'${folderId}' in parents and trashed=false and (mimeType contains 'image/')`);
+  const f  = encodeURIComponent("files(id,name)");
+  const r  = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=${f}&pageSize=200&key=${apiKey}`);
+  if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e?.error?.message||`HTTP ${r.status}`); }
+  const d  = await r.json();
+  return d.files || [];
+}
+
+async function driveDownloadImage(fileId, apiKey) {
+  const r = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${apiKey}`);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return await r.blob();
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+function App() {
+  const [apiKey,  setApiKey]  = useState(()=> localStorage.getItem(LS_KEY)    || "");
+  const [url,     setUrl]     = useState(()=> localStorage.getItem(LS_FOLDER) || "");
+  const [phase,   setPhase]   = useState("start"); // start | loading | slideshow
+  const [loadMsg, setLoadMsg] = useState("");
+  const [loadPct, setLoadPct] = useState(0);
+  const [error,   setError]   = useState("");
+  const [images,  setImages]  = useState([]); // [{id, name, objUrl}]
+  const [idx,     setIdx]     = useState(0);
+  const [playing, setPlaying] = useState(true);
+  const [fading,  setFading]  = useState(false);
+  const [progress,setProgress]= useState(0);
+  const [showUI,  setShowUI]  = useState(true);
+  const [isFS,    setIsFS]    = useState(false);
+  const [toast,   setToast]   = useState(null);
+  const [refreshing,setRefreshing] = useState(false);
+  const [nextRefresh,setNextRefresh] = useState(null);
+  const [showKey, setShowKey] = useState(false);
+
+  const containerRef = useRef(null);
+  const rafRef       = useRef(null);
+  const blockRef     = useRef(false);
+  const uiTimerRef   = useRef(null);
+  const toastTimer   = useRef(null);
+  const progStart    = useRef(null);
+  const playingRef   = useRef(playing);
+  const idxRef       = useRef(idx);
+  const imagesRef    = useRef(images);
+  const folderIdRef  = useRef(null);
+  const apiKeyRef    = useRef(apiKey);
+  const refreshTimer = useRef(null);
+  const countdownRef = useRef(null);
+  const touchStart   = useRef(null);
+
+  useEffect(()=>{ playingRef.current = playing; },[playing]);
+  useEffect(()=>{ idxRef.current     = idx;     },[idx]);
+  useEffect(()=>{ imagesRef.current  = images;  },[images]);
+  useEffect(()=>{ apiKeyRef.current  = apiKey;  },[apiKey]);
+
+  // ── Revoke old object URLs on unmount ─────────────────────────────────────
+  useEffect(()=> ()=> images.forEach(im=> URL.revokeObjectURL(im.objUrl)), []);
+
+  const showToast = (msg, type="info") => {
+    setToast({msg,type});
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(()=>setToast(null), 3500);
+  };
+
+  // ── Load & cache images ───────────────────────────────────────────────────
+  const startSlideshow = async () => {
+    if (!apiKey.trim()) { setError("Anna ensin Google API-avain"); return; }
+    const fid = extractFolderId(url);
+    if (!fid) { setError("Anna kelvollinen Drive-kansion URL tai ID"); return; }
+    folderIdRef.current = fid;
+    localStorage.setItem(LS_KEY,    apiKey.trim());
+    localStorage.setItem(LS_FOLDER, url.trim());
+    setPhase("loading"); setError("");
+
+    try {
+      // Check cache first
+      setLoadMsg("Tarkistetaan välimuisti…"); setLoadPct(5);
+      const cached = await dbGetAll();
+
+      // Try to fetch fresh list from Drive
+      let driveFiles = null;
+      try {
+        setLoadMsg("Haetaan kuvat Drivesta…"); setLoadPct(10);
+        driveFiles = await driveListImages(fid, apiKey.trim());
+      } catch(e) {
+        // Offline or error — use cache if available
+        if (cached.length) {
+          const imgs = cached.map(r=>({ id:r.id, name:r.name, objUrl:URL.createObjectURL(r.blob) }));
+          setImages(imgs); setIdx(0); setPhase("slideshow");
+          showToast("Offline — käytetään välimuistia","info");
+          return;
+        }
+        throw new Error("Ei nettiyhteyttä eikä välimuistia: "+e.message);
+      }
+
+      if (!driveFiles.length) throw new Error("Kansiossa ei ole kuvatiedostoja");
+
+      // Download only files not in cache
+      const cachedIds = new Set(cached.map(r=>r.id));
+      const toDownload = driveFiles.filter(f=>!cachedIds.has(f.id));
+      const total = toDownload.length;
+
+      setLoadMsg(total > 0 ? `Ladataan ${total} kuvaa…` : "Kaikki kuvat välimuistissa!`");
+      setLoadPct(15);
+
+      for (let i=0; i<toDownload.length; i++) {
+        const f = toDownload[i];
+        setLoadMsg(`Ladataan kuva ${i+1} / ${total}…`);
+        setLoadPct(15 + Math.round((i/total)*80));
+        try {
+          const blob = await driveDownloadImage(f.id, apiKey.trim());
+          await dbPut({ id:f.id, name:f.name, blob });
+        } catch(e) {
+          // Skip failed image silently
+        }
+      }
+
+      setLoadPct(100);
+      setLoadMsg("Käynnistetään…");
+
+      // Build images from cache (includes newly downloaded)
+      const allCached = await dbGetAll();
+      // Keep only files that still exist in Drive (preserve order from Drive)
+      const driveIdSet = new Set(driveFiles.map(f=>f.id));
+      const cachedMap  = Object.fromEntries(allCached.map(r=>[r.id, r]));
+      const imgs = driveFiles
+        .filter(f => cachedMap[f.id])
+        .map(f => ({ id:f.id, name:f.name, objUrl:URL.createObjectURL(cachedMap[f.id].blob) }));
+
+      if (!imgs.length) throw new Error("Kuvien lataaminen epäonnistui");
+      setImages(imgs); setIdx(0);
+      setTimeout(()=>setPhase("slideshow"), 300);
+
+    } catch(e) {
+      setError("Virhe: "+e.message);
+      setPhase("start");
+    }
+  };
+
+  // ── Background refresh ────────────────────────────────────────────────────
+  const doRefresh = useCallback(async (silent=true) => {
+    const fid = folderIdRef.current;
+    const key = apiKeyRef.current;
+    if (!fid || !key) return;
+    if (!silent) setRefreshing(true);
+    try {
+      const driveFiles = await driveListImages(fid, key);
+      const cached = await dbGetAll();
+      const cachedIds = new Set(cached.map(r=>r.id));
+      const newFiles = driveFiles.filter(f=>!cachedIds.has(f.id));
+
+      if (!newFiles.length) {
+        if (!silent) showToast("Ei uusia kuvia","info");
+        return;
+      }
+
+      // Download new images
+      const downloaded = [];
+      for (const f of newFiles) {
+        try {
+          const blob = await driveDownloadImage(f.id, key);
+          await dbPut({ id:f.id, name:f.name, blob });
+          downloaded.push({ id:f.id, name:f.name, objUrl:URL.createObjectURL(blob) });
+        } catch(e) { /* skip */ }
+      }
+
+      if (downloaded.length) {
+        setImages(prev => [...prev, ...downloaded]);
+        showToast(`+${downloaded.length} uusi${downloaded.length>1?"a":""} kuva${downloaded.length>1?"a":""}`, "new");
+      }
+    } catch(e) {
+      // Offline — silently ignore
+      if (!silent) showToast("Ei nettiyhteyttä","info");
+    } finally {
+      if (!silent) setRefreshing(false);
+    }
+  },[]);
+
+  const startRefreshCycle = useCallback(()=>{
+    clearInterval(refreshTimer.current);
+    clearInterval(countdownRef.current);
+    let rem = REFRESH_INTERVAL/1000;
+    setNextRefresh(rem);
+    countdownRef.current = setInterval(()=>{ rem-=1; setNextRefresh(rem); if(rem<=0) rem=REFRESH_INTERVAL/1000; },1000);
+    refreshTimer.current = setInterval(()=>{ doRefresh(true); rem=REFRESH_INTERVAL/1000; setNextRefresh(rem); }, REFRESH_INTERVAL);
+  },[doRefresh]);
+
+  useEffect(()=>{
+    if (phase==="slideshow") startRefreshCycle();
+    return ()=>{ clearInterval(refreshTimer.current); clearInterval(countdownRef.current); };
+  },[phase, startRefreshCycle]);
+
+  // ── Navigation ────────────────────────────────────────────────────────────
+  const goTo = useCallback((next)=>{
+    blockRef.current  = true;
+    progStart.current = null;
+    setFading(true); setProgress(0);
+    setTimeout(()=>{ setIdx(next); setFading(false); blockRef.current=false; }, 500);
+  },[]);
+
+  const next = useCallback(()=> goTo((idxRef.current+1) % imagesRef.current.length),[goTo]);
+  const prev = useCallback(()=> goTo((idxRef.current-1+imagesRef.current.length) % imagesRef.current.length),[goTo]);
+
+  // ── RAF progress loop ─────────────────────────────────────────────────────
+  useEffect(()=>{
+    if (phase!=="slideshow" || images.length<2) return;
+    progStart.current = performance.now();
+    const tick = ()=>{
+      if (!playingRef.current) { rafRef.current=requestAnimationFrame(tick); return; }
+      if (!progStart.current) progStart.current=performance.now();
+      const elapsed = performance.now()-progStart.current;
+      setProgress(Math.min(elapsed/SLIDE_DURATION,1));
+      if (elapsed>=SLIDE_DURATION && !blockRef.current) {
+        const n=(idxRef.current+1)%imagesRef.current.length;
+        blockRef.current=true;
+        setFading(true); setProgress(0); progStart.current=null;
+        setTimeout(()=>{ setIdx(n); setFading(false); blockRef.current=false; },500);
+      }
+      rafRef.current=requestAnimationFrame(tick);
+    };
+    rafRef.current=requestAnimationFrame(tick);
+    return ()=>cancelAnimationFrame(rafRef.current);
+  },[phase, images.length]);
+  useEffect(()=>{ if(playing) progStart.current=null; },[playing]);
+
+  // ── Keyboard ──────────────────────────────────────────────────────────────
+  useEffect(()=>{
+    const h=e=>{
+      if (phase!=="slideshow") return;
+      if (e.key==="ArrowRight") next();
+      if (e.key==="ArrowLeft")  prev();
+      if (e.key===" ") { e.preventDefault(); setPlaying(p=>!p); }
+      if (e.key==="f"||e.key==="F") toggleFS();
+      if (e.key==="r"||e.key==="R") doRefresh(false);
+    };
+    window.addEventListener("keydown",h);
+    return ()=>window.removeEventListener("keydown",h);
+  },[phase,next,prev,doRefresh]);
+
+  // ── Touch / swipe ──────────────────────────────────────────────────────────
+  const onTouchStart = e => { touchStart.current = e.touches[0].clientX; };
+  const onTouchEnd   = e => {
+    if (touchStart.current===null) return;
+    const dx = e.changedTouches[0].clientX - touchStart.current;
+    touchStart.current = null;
+    if (Math.abs(dx) < 40) { resetUI(); return; } // tap = show UI
+    if (dx < 0) next(); else prev();
+  };
+
+  // ── Fullscreen ────────────────────────────────────────────────────────────
+  const toggleFS = ()=>{
+    if (!document.fullscreenElement) { document.documentElement.requestFullscreen(); setIsFS(true); }
+    else { document.exitFullscreen(); setIsFS(false); }
+  };
+  useEffect(()=>{
+    const h=()=>setIsFS(!!document.fullscreenElement);
+    document.addEventListener("fullscreenchange",h);
+    return ()=>document.removeEventListener("fullscreenchange",h);
+  },[]);
+
+  // ── Auto-hide UI ──────────────────────────────────────────────────────────
+  const resetUI = ()=>{
+    setShowUI(true);
+    clearTimeout(uiTimerRef.current);
+    uiTimerRef.current=setTimeout(()=>setShowUI(false),2800);
+  };
+  useEffect(()=>{ if(phase==="slideshow") resetUI(); },[phase]);
+
+  function fmtCountdown(s) {
+    const m=Math.floor(s/60), sec=Math.floor(s%60);
+    return `${m}:${String(sec).padStart(2,"0")}`;
+  }
+
+  // ── Styles ────────────────────────────────────────────────────────────────
+  const css = `
+    @keyframes spin { to { transform:rotate(360deg); } }
+    @keyframes toastIn { from{opacity:0;transform:translateY(8px) translateX(-50%)} to{opacity:1;transform:translateY(0) translateX(-50%)} }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:none} }
+
+    .wrap { min-height:100vh; background:#0a0a0a; display:flex; align-items:center;
+            justify-content:center; padding:2rem; }
+    .card { width:100%; max-width:460px; animation:fadeIn .4s ease; }
+
+    .title { font-family:'Cormorant Garamond',Georgia,serif; font-size:3rem; font-weight:300;
+             color:#f5f0e8; text-align:center; letter-spacing:.08em; margin-bottom:.25rem; }
+    .sub   { font-family:'DM Mono',monospace; font-size:.65rem; color:#888;
+             text-align:center; letter-spacing:.22em; text-transform:uppercase; margin-bottom:2.5rem; }
+
+    .label { font-family:'DM Mono',monospace; font-size:.65rem; color:#aaa;
+             letter-spacing:.15em; text-transform:uppercase; margin-bottom:.45rem; display:block; }
+    .input { width:100%; background:#1c1c1c; color:#e8e0d0; border:1px solid #3a3a3a;
+             border-radius:5px; padding:.9rem 1rem; font-family:'DM Mono',monospace;
+             font-size:.75rem; outline:none; transition:border-color .2s; margin-bottom:1rem; }
+    .input:focus { border-color:#c8a96e; }
+    .input::placeholder { color:#555; }
+    .key-wrap { position:relative; }
+    .eye-btn { position:absolute; right:.8rem; top:50%; transform:translateY(-65%);
+               background:none; border:none; color:#666; cursor:pointer; font-size:.9rem; padding:0; }
+    .eye-btn:hover { color:#aaa; }
+
+    .divider { border:none; border-top:1px solid #222; margin:.5rem 0 1.2rem; }
+
+    .btn { width:100%; background:transparent; border:1px solid #c8a96e; color:#c8a96e;
+           font-family:'DM Mono',monospace; font-size:.7rem; letter-spacing:.2em;
+           text-transform:uppercase; padding:.9rem; border-radius:5px; cursor:pointer;
+           transition:background .2s,color .2s; }
+    .btn:hover:not(:disabled) { background:#c8a96e; color:#0a0a0a; }
+    .btn:disabled { opacity:.3; cursor:default; }
+
+    .err { font-family:'DM Mono',monospace; font-size:.65rem; color:#d06060;
+           text-align:center; margin-top:.75rem; }
+    .hint { font-family:'DM Mono',monospace; font-size:.58rem; color:#444;
+            text-align:center; margin-top:1.8rem; line-height:2; }
+
+    /* Loading */
+    .load-wrap { min-height:100vh; background:#0a0a0a; display:flex; flex-direction:column;
+                 align-items:center; justify-content:center; gap:1.5rem; padding:2rem; }
+    .load-title { font-family:'Cormorant Garamond',Georgia,serif; font-size:1.6rem;
+                  font-weight:300; color:#c8c0b0; letter-spacing:.06em; }
+    .load-msg { font-family:'DM Mono',monospace; font-size:.68rem; color:#777;
+                letter-spacing:.1em; text-align:center; }
+    .prog-outer { width:240px; height:2px; background:#222; border-radius:2px; overflow:hidden; }
+    .prog-inner { height:100%; background:#c8a96e; border-radius:2px; transition:width .3s ease; }
+
+    /* Slideshow */
+    .simg { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; transition:opacity .5s ease; }
+    .ui   { position:absolute; inset:0; pointer-events:none; transition:opacity .4s ease; }
+
+    .tbar { position:absolute; top:0; left:0; right:0; padding:1.4rem 1.6rem 3rem;
+            background:linear-gradient(to bottom,rgba(0,0,0,.7),transparent);
+            display:flex; justify-content:space-between; align-items:flex-start; pointer-events:all; }
+    .fname { font-family:'Cormorant Garamond',Georgia,serif; font-style:italic;
+             font-size:.9rem; font-weight:300; color:rgba(255,255,255,.55);
+             max-width:50%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .tctrls { display:flex; gap:.45rem; align-items:center; }
+    .cnt { font-family:'DM Mono',monospace; font-size:.58rem; color:rgba(255,255,255,.35);
+           letter-spacing:.15em; margin-right:.3rem; }
+    .cbtn { background:rgba(255,255,255,.1); border:1px solid rgba(255,255,255,.15);
+            color:rgba(255,255,255,.75); border-radius:4px; width:36px; height:36px;
+            display:flex; align-items:center; justify-content:center; cursor:pointer;
+            font-size:.8rem; backdrop-filter:blur(4px); transition:background .15s; }
+    .cbtn:hover { background:rgba(255,255,255,.22); }
+    .cbtn.spinning { animation:spin .9s linear infinite; }
+
+    .abtn { position:absolute; top:50%; transform:translateY(-50%);
+            background:rgba(0,0,0,.35); border:1px solid rgba(255,255,255,.12);
+            color:rgba(255,255,255,.85); width:48px; height:48px; border-radius:50%;
+            display:flex; align-items:center; justify-content:center; cursor:pointer;
+            font-size:1.5rem; backdrop-filter:blur(4px);
+            transition:background .15s,transform .15s; pointer-events:all; }
+    .abtn:hover { background:rgba(0,0,0,.65); transform:translateY(-50%) scale(1.08); }
+
+    .bbar { position:absolute; bottom:0; left:0; right:0; padding:3rem 2rem 1.4rem;
+            background:linear-gradient(to top,rgba(0,0,0,.65),transparent);
+            display:flex; flex-direction:column; align-items:center; gap:.75rem; pointer-events:all; }
+    .dots { display:flex; gap:6px; align-items:center; flex-wrap:wrap; justify-content:center; max-width:80%; }
+    .dot  { border-radius:99px; background:rgba(255,255,255,.3); cursor:pointer; height:5px; transition:all .2s; }
+    .dot:hover { background:rgba(255,255,255,.6); }
+    .rrow { display:flex; align-items:center; gap:.6rem; }
+    .ptrack { width:140px; height:1px; background:rgba(255,255,255,.12); border-radius:1px; overflow:hidden; }
+    .pfill  { height:100%; background:rgba(200,169,110,.85); border-radius:1px; }
+    .rlabel { font-family:'DM Mono',monospace; font-size:.55rem; color:rgba(255,255,255,.22); letter-spacing:.1em; }
+
+    .swipe-hint { font-family:'DM Mono',monospace; font-size:.55rem; color:rgba(255,255,255,.2);
+                  letter-spacing:.1em; display:none; }
+    @media (pointer:coarse) { .swipe-hint { display:block; } .abtn { display:none; } }
+
+    .toast { position:absolute; top:1.2rem; left:50%; transform:translateX(-50%);
+             font-family:'DM Mono',monospace; font-size:.65rem; letter-spacing:.1em;
+             padding:.5rem 1.2rem; border-radius:4px; pointer-events:none;
+             animation:toastIn .3s ease; white-space:nowrap; z-index:99; }
+    .t-new  { background:rgba(200,169,110,.18); border:1px solid rgba(200,169,110,.4); color:#c8a96e; }
+    .t-info { background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.15); color:rgba(255,255,255,.55); }
+    .t-err  { background:rgba(180,80,80,.18); border:1px solid rgba(180,80,80,.35); color:#c06060; }
+  `;
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // START
+  // ─────────────────────────────────────────────────────────────────────────
+  if (phase==="start") return (
+    <div className="wrap">
+      <style>{css}</style>
+      <div className="card">
+        <h1 className="title">Diashow</h1>
+        <p className="sub">Google Drive · Valokuvat</p>
+
+        <label className="label">Google API-avain</label>
+        <div className="key-wrap">
+          <input className="input" type={showKey?"text":"password"} value={apiKey}
+            onChange={e=>setApiKey(e.target.value)}
+            placeholder="AIza…" style={{paddingRight:"2.5rem"}} />
+          <button className="eye-btn" onClick={()=>setShowKey(s=>!s)}>{showKey?"🙈":"👁"}</button>
+        </div>
+
+        <hr className="divider"/>
+
+        <label className="label">Drive-kansion linkki</label>
+        <input className="input" type="text" value={url}
+          onChange={e=>setUrl(e.target.value)}
+          onKeyDown={e=>e.key==="Enter"&&startSlideshow()}
+          placeholder="https://drive.google.com/drive/folders/…" />
+
+        {error && <p className="err">{error}</p>}
+
+        <button className="btn" onClick={startSlideshow} disabled={!url.trim()||!apiKey.trim()}>
+          Käynnistä diashow
+        </button>
+
+        <p className="hint">
+          Kuvat tallennetaan selaimeen — toimii ilman nettiä<br/>
+          ← → nuolet · välilyönti = tauko · F = koko näyttö · R = päivitä
+        </p>
+      </div>
+    </div>
+  );
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // LOADING
+  // ─────────────────────────────────────────────────────────────────────────
+  if (phase==="loading") return (
+    <div className="load-wrap">
+      <style>{css}</style>
+      <p className="load-title">Valmistellaan diashowta</p>
+      <div className="prog-outer"><div className="prog-inner" style={{width:`${loadPct}%`}}/></div>
+      <p className="load-msg">{loadMsg}</p>
+    </div>
+  );
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // SLIDESHOW
+  // ─────────────────────────────────────────────────────────────────────────
+  const cur = images[idx];
+  return (
+    <div ref={containerRef}
+      onMouseMove={resetUI}
+      onTouchStart={onTouchStart}
+      onTouchEnd={onTouchEnd}
+      style={{position:"relative",width:"100vw",height:"100vh",background:"#000",
+              overflow:"hidden",cursor:showUI?"default":"none",userSelect:"none"}}>
+      <style>{css}</style>
+
+      <img key={idx} src={cur.objUrl} alt={cur.name}
+        className="simg" style={{opacity:fading?0:1}} />
+
+      {toast && <div className={`toast t-${toast.type}`}>{toast.msg}</div>}
+
+      <div className="ui" style={{opacity:showUI?1:0}}>
+        <div className="tbar">
+          <span className="fname">{cur.name}</span>
+          <div className="tctrls">
+            <span className="cnt">{idx+1} / {images.length}</span>
+            <button className="cbtn" onClick={()=>setPlaying(p=>!p)} title="Tauko">{playing?"⏸":"▶"}</button>
+            <button className={`cbtn${refreshing?" spinning":""}`} onClick={()=>doRefresh(false)}
+              title="Päivitä (R)" style={{fontSize:"1rem"}}>↻</button>
+            <button className="cbtn" onClick={toggleFS} title="Koko näyttö (F)">{isFS?"✕":"⛶"}</button>
+          </div>
+        </div>
+
+        <button className="abtn" style={{left:"1.5rem"}} onClick={prev}>‹</button>
+        <button className="abtn" style={{right:"1.5rem"}} onClick={next}>›</button>
+
+        <div className="bbar">
+          {images.length<=50 &&
+            <div className="dots">
+              {images.map((_,i)=>(
+                <div key={i} className="dot"
+                  style={{width:i===idx?"20px":"5px",
+                          background:i===idx?"rgba(255,255,255,.9)":undefined}}
+                  onClick={()=>goTo(i)}/>
+              ))}
+            </div>}
+          <div className="rrow">
+            {playing && <div className="ptrack"><div className="pfill" style={{width:`${progress*100}%`,transition:"width .1s linear"}}/></div>}
+            {nextRefresh!=null && <span className="rlabel">↻ {fmtCountdown(nextRefresh)}</span>}
+          </div>
+          <span className="swipe-hint">← pyyhkäise →</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
